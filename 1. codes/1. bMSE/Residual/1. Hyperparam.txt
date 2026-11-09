@@ -1,0 +1,309 @@
+# hyperparameter_tuning_residual.py bMSE
+
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.model_selection import train_test_split
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Dense, BatchNormalization, Dropout, Add
+from tensorflow.keras.optimizers import AdamW
+import keras_tuner as kt
+import gc
+import math
+from scipy.optimize import brentq
+
+
+# ===============================
+# GPU OPTIMIZATION
+# ===============================
+
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    for gpu in gpus:
+        tf.config.experimental.set_memory_growth(gpu, True)
+    print(f'✓ GPU memory growth enabled for {len(gpus)} GPU(s)')
+
+np.random.seed(42)
+tf.random.set_seed(42)
+
+
+# ===============================
+# CONFIGURATION (match training)
+# ===============================
+
+DATA_FILE = "/kaggle/input/datasets/general005/dataset-preproc-allcat-1/version_3_full_catC.parquet"  # adjust path
+OUTPUT_FOLDER = "hyperparam_tuning_residual_bMSE_trial2"
+FILE_NAME = "best_hyperparameters_residual_bMSE_trial2.json"
+SHOCK_FOCUS_MODE = True
+gamma = 1.4
+
+
+# ===============================
+# LOAD PREPROCESSED DATA
+# ===============================
+
+print("="*70)
+print("LOADING PREPROCESSED DATA (Code I Version 4)")
+print("="*70)
+
+df = pd.read_parquet(DATA_FILE)
+
+# Add engineered features if not present
+if 'compressibility' not in df.columns:
+    df['compressibility'] = ((gamma - 1) / 2 * df['mach_input']**2)
+if 'mach_squared' not in df.columns:
+    df['mach_squared'] = df['mach_input']**2
+if 'polar_angle' not in df.columns:
+    df['polar_angle'] = np.arctan2(df['y-coordinate'], df['x-coordinate'])
+
+def theta_beta_mach(mach, wedge_deg):   
+    try:
+        mu = np.degrees(np.arcsin(1.0 / mach))
+    except (ValueError, ZeroDivisionError):
+        return np.nan
+
+    def residual(b):
+        br = np.radians(b)
+        return (np.tan(np.radians(wedge_deg)) -
+                2.0 / np.tan(br) *
+                (mach**2 * np.sin(br)**2 - 1.0) /
+                (mach**2 * (gamma + np.cos(2 * br)) + 2.0))
+
+    bv = np.linspace(mu + 0.5, 89.0, 800)
+    sv = [residual(b) for b in bv]
+    crossings = [(bv[i], bv[i+1]) for i in range(len(sv) - 1)
+                 if sv[i] * sv[i+1] < 0]
+    if not crossings:
+        return np.nan
+    try:
+        return brentq(residual, crossings[0][0], crossings[0][1])
+    except Exception:
+        return np.nan
+
+# Base sample weights (to be multiplied by tuned factor later)
+if SHOCK_FOCUS_MODE and 'region' in df.columns:
+    print(f"Transition points: {(df['region'] == 'transition').sum():,}")
+
+X_FEATURES = ['x-coordinate', 'y-coordinate', 'mach_input', 'angle_input',
+              'compressibility', 'mach_squared', 'polar_angle',
+              'r_from_tip', 'dist_from_wedge']
+Y_FEATURES = ['pressure', 'density', 'mach-number', 'velocity-magnitude', 'temperature']
+
+X_raw = df[X_FEATURES].values
+y_raw = df[Y_FEATURES].values
+
+gc.collect()
+
+
+# ===============================
+# TRAIN/VALIDATION SPLIT
+# ===============================
+
+idx = np.arange(len(X_raw))
+region_raw = df['region'].values if 'region' in df.columns else np.zeros(len(df))
+X_train_raw, X_val_raw, y_train_raw, y_val_raw, idx_train, idx_val, region_train, region_val = train_test_split(
+    X_raw, y_raw, idx, region_raw, test_size=0.20, random_state=42
+)
+print(f"Training samples: {len(X_train_raw):,}")
+print(f"Validation samples: {len(X_val_raw):,}")
+
+
+# ===============================
+# SCALING (fit on training only)
+# ===============================
+
+scaler_coords           = MinMaxScaler().fit(X_train_raw[:, :2])
+scaler_mach_in          = StandardScaler().fit(X_train_raw[:, 2:3])
+scaler_angle            = StandardScaler().fit(X_train_raw[:, 3:4])
+scaler_compressibility  = StandardScaler().fit(X_train_raw[:, 4:5])
+scaler_mach_squared     = StandardScaler().fit(X_train_raw[:, 5:6])
+scaler_polar_angle      = StandardScaler().fit(X_train_raw[:, 6:7])
+scaler_r_from_tip       = StandardScaler().fit(X_train_raw[:, 7:8])
+scaler_dist_from_wedge  = StandardScaler().fit(X_train_raw[:, 8:9])
+
+def scale_inputs(X):
+    coords   = scaler_coords.transform(X[:, :2])
+    mach     = scaler_mach_in.transform(X[:, 2:3])
+    angle    = scaler_angle.transform(X[:, 3:4])
+    comp     = scaler_compressibility.transform(X[:, 4:5])
+    mach_sq  = scaler_mach_squared.transform(X[:, 5:6])
+    polar    = scaler_polar_angle.transform(X[:, 6:7])
+    r_tip    = scaler_r_from_tip.transform(X[:, 7:8])
+    dist     = scaler_dist_from_wedge.transform(X[:, 8:9])
+    return np.hstack([coords, mach, angle, comp, mach_sq, polar, r_tip, dist])
+
+X_train = scale_inputs(X_train_raw)
+X_val = scale_inputs(X_val_raw)
+
+# Output scalers
+scaler_pressure = StandardScaler().fit(y_train_raw[:, 0].reshape(-1, 1))
+scaler_density = StandardScaler().fit(y_train_raw[:, 1].reshape(-1, 1))
+scaler_mach = StandardScaler().fit(y_train_raw[:, 2].reshape(-1, 1))
+scaler_velocity = StandardScaler().fit(y_train_raw[:, 3].reshape(-1, 1))
+scaler_temperature = StandardScaler().fit(y_train_raw[:, 4].reshape(-1, 1))
+
+def scale_outputs(y):
+    return np.hstack([
+        scaler_pressure.transform(y[:, 0].reshape(-1, 1)),
+        scaler_density.transform(y[:, 1].reshape(-1, 1)),
+        scaler_mach.transform(y[:, 2].reshape(-1, 1)),
+        scaler_velocity.transform(y[:, 3].reshape(-1, 1)),
+        scaler_temperature.transform(y[:, 4].reshape(-1, 1))
+    ])
+
+y_train = scale_outputs(y_train_raw)
+y_val = scale_outputs(y_val_raw)
+
+del df
+gc.collect()
+
+
+# ===============================
+# RESIDUAL MLP MODEL BUILDING FUNCTION
+# ===============================
+
+class MyHyperModel(kt.HyperModel):
+    def __init__(self, region_train):
+        self.region_train = region_train 
+
+    def build(self, hp):
+        # --- Tuned hyperparameters ---
+        sample_weight_factor = hp.Float('sample_weight_factor', 1.0, 5.0, step=0.5)
+        self.batch_size = hp.Int('batch_size', 512, 4096, step=512)
+
+        min_lr = hp.Float('min_lr', 1e-8, 1e-5, sampling='log')
+        lr = hp.Float('lr', 1e-4, 2e-3, sampling='log')
+        wd = hp.Float('wd', 1e-6, 1e-4, sampling='log')
+
+        # --- Initial neuron size ---
+        units1 = hp.Int('units1', 256, 512, step=64)
+        dropout1 = hp.Float('dropout1', 0.0, 0.4, step=0.05)
+
+        # --- Residual block hyperparameters ---
+        num_blocks = hp.Int('num_blocks', 1, 3, step=1)
+        units = hp.Int('units', 64, 448, step=64)
+        dropout = hp.Float('dropout', 0.0, 0.4, step=0.05)
+
+        # --- Final layers hyperparameters ---
+        final_units1 = hp.Int('final_units1', 32, 128, step=16)
+        final_dropout = hp.Float('final_dropout', 0.0, 0.3, step=0.05)
+
+        # Build the model
+        inputs = Input(shape=(9,))
+        x = inputs
+
+        # Initial projection (optional, could be omitted)
+        x = Dense(units1, activation='relu', kernel_initializer='he_normal')(x)
+        x = BatchNormalization()(x)
+        x = Dropout(dropout1)(x)
+
+        # Residual blocks
+        for _ in range(num_blocks):
+            shortcut = x
+            x = Dense(units, activation='relu', kernel_initializer='he_normal')(x)
+            x = BatchNormalization()(x)
+            x = Dropout(dropout)(x)
+            x = Dense(units, activation='relu', kernel_initializer='he_normal')(x)
+            x = BatchNormalization()(x)
+            # If shortcut dimension doesn't match, project it
+            if shortcut.shape[-1] != x.shape[-1]:
+                shortcut = Dense(units, activation=None)(shortcut)
+            x = Add()([x, shortcut])
+            x = Dropout(dropout)(x)   
+
+        # Final dense layers
+        x = Dense(final_units1, activation='relu')(x)
+        x = BatchNormalization()(x)
+        x = Dropout(final_dropout)(x)
+        outputs = Dense(5)(x)
+
+        model = Model(inputs, outputs)
+	
+        def data_MSE(y_true, y_pred):
+            return tf.reduce_mean(tf.square(y_true - y_pred))
+	    
+        def data_MAE(y_true, y_pred):
+    	    return tf.reduce_mean(tf.abs(y_true - y_pred)) 
+    
+        optimizer = AdamW(learning_rate=lr, weight_decay=wd, clipnorm=1.0)
+        model.compile(optimizer=optimizer, loss='mse', metrics=[data_MSE,data_MAE])
+
+        return model
+
+    def fit(self, hp, model, x, y, validation_data, callbacks=None, **kwargs):
+        # Use the batch size from hyperparameters
+        batch_size           = hp.get('batch_size')
+        sample_weight_factor = hp.get('sample_weight_factor')
+        min_lr               = hp.get('min_lr')
+        sw = np.where(self.region_train == 'transition',
+                      sample_weight_factor, 1.0)
+
+        tuning_callbacks = list(callbacks or [])
+        tuning_callbacks.append(
+        	tf.keras.callbacks.ReduceLROnPlateau(
+            	monitor='val_loss',
+            	factor=0.5,
+            	patience=10,        
+            	min_lr=min_lr,
+            	verbose=0,
+        	)
+    	)
+
+        return model.fit(
+            x, y,
+            batch_size=batch_size,
+            sample_weight=sw,
+            validation_data=validation_data,
+            callbacks=tuning_callbacks,
+            **kwargs
+        )
+
+# ===============================
+# SET UP KERAS TUNER
+# ===============================
+
+tuner = kt.Hyperband(
+    MyHyperModel(region_train=region_train),
+    objective=kt.Objective('val_loss', direction='min'),
+    max_epochs=50,
+    factor=3,
+    hyperband_iterations=1,
+    directory=OUTPUT_FOLDER,
+    project_name='residual_DNN_bMSE_tuning',
+    overwrite=True
+)
+
+print("\n" + "="*70)
+print("STARTING HYPERPARAMETER SEARCH (Residual MLP)")
+print("="*70)
+
+tuner.search(
+    X_train, y_train,
+    validation_data=(X_val, y_val),
+    epochs=50,
+    callbacks=[tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True)],
+    verbose=1
+)
+
+
+# ===============================
+# RESULTS
+# ===============================
+
+print("\n" + "="*70)
+print("TUNING COMPLETE")
+print("="*70)
+
+best_hps = tuner.get_best_hyperparameters(num_trials=1)[0]
+print("\nBest hyperparameters found:")
+for param in best_hps.values:
+    print(f"  {param}: {best_hps.get(param)}")
+
+# Save best hyperparameters to file
+import json
+with open(FILE_NAME, 'w') as f:
+    json.dump(best_hps.values, f, indent=2)
+print("\nBest hyperparameters saved to 'best_hyperparameters_residual.json'")
+
+print("\n✅ Hyperparameter tuning finished.")
