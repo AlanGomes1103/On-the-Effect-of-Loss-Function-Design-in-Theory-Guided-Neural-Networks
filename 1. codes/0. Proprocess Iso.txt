@@ -1,0 +1,1197 @@
+# PREPROCESSING CODE — VERSION 3 ONLY (Shock Line Fitting)
+"""
+=============================================================================
+CODE I — DATA PREPROCESSING : VERSION 3 SHOCK LINE FITTING
+=============================================================================
+"""
+
+import os
+import re
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.linear_model import RANSACRegressor
+from scipy.stats import ks_2samp
+from datetime import datetime
+import joblib
+import gc
+from tqdm import tqdm
+from scipy.optimize import brentq
+from pathlib import Path
+
+warnings.filterwarnings('ignore')
+
+
+# ============================================
+# CONFIGURATION
+# ============================================
+
+INPUT_DIR  = "/kaggle/input/datasets/general005/dataset-cat-d"
+OUTPUT_DIR = "/kaggle/working/preprocessed_v3_catD"
+
+VERSIONS_DIR     = os.path.join(OUTPUT_DIR, "versions")
+DIAGNOSTICS_DIR  = os.path.join(OUTPUT_DIR, "diagnostics")
+LINE_PROFILES_DIR= os.path.join(OUTPUT_DIR, "line_profiles")
+VERIFICATION_DIR = os.path.join(OUTPUT_DIR, "verification")
+
+os.makedirs(OUTPUT_DIR,        exist_ok=True)
+os.makedirs(VERSIONS_DIR,      exist_ok=True)
+os.makedirs(DIAGNOSTICS_DIR,   exist_ok=True)
+os.makedirs(LINE_PROFILES_DIR, exist_ok=True)
+os.makedirs(VERIFICATION_DIR,  exist_ok=True)
+
+GEOMETRY = {
+    'x_min': 0.00,
+    'x_max': 0.30,
+    'y_min': 0.00,
+    'y_max': 0.45,
+    'wedge_apex_x': 0.0,
+    'wedge_apex_y': 0.0,
+}
+
+# Sampling parameters
+PRE_SHOCK_SAMPLE_FRAC = 0.02
+POST_SHOCK_SAMPLE_GRID = 50
+TRANSITION_BAND_WIDTH  = 0.005   # total width; ±0.0025 m each side
+
+# Reproducibility
+RANDOM_SEED = 42
+np.random.seed(RANDOM_SEED)
+
+# Line profile extraction positions
+LINE_PROFILES_X = np.array([0.05, 0.10, 0.15, 0.20, 0.25, 0.30])
+LINE_PROFILES_Y = np.array([0.05, 0.09, 0.13, 0.18, 0.22, 0.27])
+
+
+# ============================================
+# HELPER FUNCTIONS
+# ============================================
+
+def parse_filename_raw(fname):
+    fname = os.path.basename(fname)
+
+    # wedge_M2_0_angle12_5.xlsx
+    m = re.search(r'(?:wedge|oblique)_M(\d+)_(\d+)_angle(\d+)_(\d+)', fname, re.IGNORECASE)
+    if m:
+        return float(f"{m.group(1)}.{m.group(2)}"), float(f"{m.group(3)}.{m.group(4)}")
+
+    # wedge_M2_0_angle7.xlsx
+    m = re.search(r'(?:wedge|oblique)_M(\d+)_(\d+)_angle(\d+)(?:[^\d_]|$)', fname, re.IGNORECASE)
+    if m:
+        return float(f"{m.group(1)}.{m.group(2)}"), float(m.group(3))
+
+    # wedge_M2.5_angle10.xlsx
+    m = re.search(r'(?:wedge|oblique)_M(\d+\.\d+)_angle(\d+(?:\.\d+)?)', fname, re.IGNORECASE)
+    if m:
+        return float(m.group(1)), float(m.group(2))
+
+    # wedge_M3_angle10.xlsx
+    m = re.search(r'(?:wedge|oblique)_M(\d+)_angle(\d+(?:\.\d+)?)', fname, re.IGNORECASE)
+    if m:
+        return float(m.group(1)), float(m.group(2))
+
+    # Generic fallback
+    m = re.search(r'_M(\d+)_(\d+)_', fname, re.IGNORECASE)
+    if m:
+        return float(f"{m.group(1)}.{m.group(2)}"), 0.0
+
+    return None, None
+
+
+def parse_filename(fname):
+    mach, angle = parse_filename_raw(fname)
+    if mach is None:
+        return None, None
+    return round(mach, 6), round(angle, 6)
+
+
+def compute_theoretical_shock_angle(mach, wedge_angle_deg):
+    """
+    Solve the θ-β-M relation for an oblique shock (weak solution).
+    Returns shock angle β in degrees, or NaN if detached / no solution.
+    """
+    if wedge_angle_deg <= 0:
+        return np.nan
+    gamma = 1.4
+    try:
+        mach_angle = np.degrees(np.arcsin(1.0 / mach))
+    except (ValueError, ZeroDivisionError):
+        return np.nan
+
+    def shock_relation(beta_deg):
+        beta_rad  = np.radians(beta_deg)
+        wedge_rad = np.radians(wedge_angle_deg)
+        tan_theta = (2 / np.tan(beta_rad) *
+                     (mach**2 * np.sin(beta_rad)**2 - 1) /
+                     (mach**2 * (gamma + np.cos(2 * beta_rad)) + 2))
+        return np.tan(wedge_rad) - tan_theta
+
+    bv = np.linspace(mach_angle + 0.5, 89, 500)
+    sv = [shock_relation(b) for b in bv]
+    sc = [(bv[i], bv[i+1]) for i in range(len(sv)-1) if sv[i]*sv[i+1] < 0]
+    if not sc:
+        return np.nan
+    try:
+        return brentq(shock_relation, sc[0][0], sc[0][1])
+    except Exception:
+        return np.nan
+
+
+def fit_shock_line(points, slope_only=True):
+    """
+    Fit a line through shock candidate points using RANSAC.
+    When slope_only=True, the intercept is forced to zero
+    (shock must pass through the wedge apex at the origin).
+
+    Returns (slope, intercept, angle_deg) or (None, None, None).
+    """
+    if len(points) < 2:
+        return None, None, None
+
+    X = points[:, 0].reshape(-1, 1)
+    y = points[:, 1]
+
+    ransac = RANSACRegressor(random_state=RANDOM_SEED, residual_threshold=0.01)
+    ransac.fit(X, y)
+
+    if slope_only:
+        # Origin-forced least-squares slope
+        slope     = np.sum(X.flatten() * y) / (np.sum(X.flatten()**2) + 1e-10)
+        intercept = 0.0
+    else:
+        slope     = ransac.estimator_.coef_[0]
+        intercept = ransac.estimator_.intercept_
+
+    angle_deg = np.degrees(np.arctan(slope))
+    return slope, intercept, angle_deg
+
+
+def remove_region_outliers(df, z_thresh=3.0):
+    """
+    Remove physically implausible points within each region using z-score.
+    Pre-shock outlier threshold is looser (z_thresh × 1.5) because
+    freestream is genuinely uniform — any deviation is almost certainly
+    a mesh artefact.
+
+    Returns (clean_df, removal_stats).
+    """
+    FLOW_VARS = ['pressure', 'density', 'temperature', 'velocity-magnitude', 'mach-number']
+    clean_parts  = []
+    removal_stats = {}
+
+    for region in ['pre', 'post', 'transition']:
+        region_df = df[df['region'] == region].copy()
+        if len(region_df) == 0:
+            continue
+
+        thresh       = z_thresh * 1.5 if region == 'pre' else z_thresh
+        outlier_mask = pd.Series(False, index=region_df.index)
+
+        for var in FLOW_VARS:
+            if var not in region_df.columns:
+                continue
+            vals = region_df[var]
+            mean, std = vals.mean(), vals.std()
+            if std < 1e-10:
+                continue
+            outlier_mask |= (np.abs((vals - mean) / std) > thresh)
+
+        n_before = len(region_df)
+        clean_region = region_df[~outlier_mask]
+        n_removed    = n_before - len(clean_region)
+
+        removal_stats[region] = {
+            'before': n_before,
+            'removed': n_removed,
+            'fraction_removed': n_removed / n_before if n_before > 0 else 0,
+        }
+        clean_parts.append(clean_region)
+
+    clean_df = pd.concat(clean_parts, ignore_index=False)
+    return clean_df, removal_stats
+
+
+def validate_rankine_hugoniot(df, mach, wedge_angle_deg, shock_angle_deg=None):
+    """
+    Validate region classification against Rankine-Hugoniot jump conditions.
+    Returns a dict with ratios, theoretical values, and pass/fail flags.
+    Tolerance: 5% on each of P, T, rho ratios.
+    """
+    gamma = 1.4
+    pre  = df[df['region'] == 'pre']
+    post = df[df['region'] == 'post']
+
+    if len(pre) == 0 or len(post) == 0:
+        return {'valid': False, 'reason': 'missing region'}
+    if wedge_angle_deg <= 0:
+        return {'valid': False, 'reason': 'bow shock — no single beta'}
+
+    p1,  T1,  rho1 = pre['pressure'].mean(),  pre['temperature'].mean(),  pre['density'].mean()
+    p2,  T2,  rho2 = post['pressure'].mean(), post['temperature'].mean(), post['density'].mean()
+
+    # Determine shock angle to use
+    if shock_angle_deg is None or (isinstance(shock_angle_deg, float) and np.isnan(shock_angle_deg)):
+        shock_angle_deg = compute_theoretical_shock_angle(mach, wedge_angle_deg)
+
+    # If analytical solution also failed, invert pressure ratio
+    if shock_angle_deg is None or (isinstance(shock_angle_deg, float) and np.isnan(shock_angle_deg)):
+        p_ratio_measured = p2 / p1
+        Mn1_sq = (p_ratio_measured * (gamma + 1) + (gamma - 1)) / (2 * gamma)
+        if Mn1_sq > 0:
+            shock_angle_deg = np.degrees(np.arcsin(
+                np.clip(np.sqrt(Mn1_sq) / mach, 0, 1)
+            ))
+        else:
+            return {'valid': False, 'reason': 'cannot determine shock angle'}
+
+    beta_rad = np.radians(shock_angle_deg)
+    Mn1      = mach * np.sin(beta_rad)
+
+    p_ratio_theory   = (2 * gamma * Mn1**2 - (gamma - 1)) / (gamma + 1)
+    T_ratio_theory   = ((2 * gamma * Mn1**2 - (gamma-1)) *
+                        ((gamma-1) * Mn1**2 + 2)) / ((gamma+1)**2 * Mn1**2)
+    rho_ratio_theory = (gamma+1) * Mn1**2 / ((gamma-1) * Mn1**2 + 2)
+
+    p_ratio_data   = p2 / p1
+    T_ratio_data   = T2 / T1
+    rho_ratio_data = rho2 / rho1
+
+    tol   = 0.05
+    p_ok  = abs(p_ratio_data   - p_ratio_theory)   / p_ratio_theory   < tol
+    T_ok  = abs(T_ratio_data   - T_ratio_theory)   / T_ratio_theory   < tol
+    rho_ok= abs(rho_ratio_data - rho_ratio_theory) / rho_ratio_theory < tol
+
+    return {
+        'valid':            p_ok and T_ok and rho_ok,
+        'shock_angle_used': shock_angle_deg,
+        'Mn1':              Mn1,
+        'p_ratio_data':     p_ratio_data,   'p_ratio_theory':   p_ratio_theory,   'p_ok':   p_ok,
+        'T_ratio_data':     T_ratio_data,   'T_ratio_theory':   T_ratio_theory,   'T_ok':   T_ok,
+        'rho_ratio_data':   rho_ratio_data, 'rho_ratio_theory': rho_ratio_theory, 'rho_ok': rho_ok,
+        'p_error_pct':    abs(p_ratio_data   - p_ratio_theory)   / p_ratio_theory   * 100,
+        'T_error_pct':    abs(T_ratio_data   - T_ratio_theory)   / T_ratio_theory   * 100,
+        'rho_error_pct':  abs(rho_ratio_data - rho_ratio_theory) / rho_ratio_theory * 100,
+    }
+
+
+def verify_region_separation(df):
+    """
+    Run two spatial and statistical tests to confirm regions are well-separated.
+    Returns a verification dict consumed by diagnostics and the black-box report.
+    """
+    verification = {'tests': {}}
+
+    # Test 1 — KS test: pre and post pressure distributions should be distinct
+    pre_p  = df[df['region'] == 'pre']['pressure'].values
+    post_p = df[df['region'] == 'post']['pressure'].values
+
+    if len(pre_p) > 0 and len(post_p) > 0:
+        ks_stat, ks_pval = ks_2samp(pre_p, post_p)
+        verification['tests']['pressure_distribution'] = {
+            'ks_statistic': ks_stat,
+            'ks_pvalue':    ks_pval,
+            'pre_mean':     pre_p.mean(),
+            'post_mean':    post_p.mean(),
+            'distinct':     ks_stat > 0.3 and ks_pval < 0.05,
+        }
+
+    # Test 2 — Spatial separation along shock-normal axis
+    pre_df  = df[df['region'] == 'pre']
+    post_df = df[df['region'] == 'post']
+
+    if len(pre_df) > 0 and len(post_df) > 0:
+        pre_cx,  pre_cy  = pre_df['x-coordinate'].mean(),  pre_df['y-coordinate'].mean()
+        post_cx, post_cy = post_df['x-coordinate'].mean(), post_df['y-coordinate'].mean()
+        dx, dy = post_cx - pre_cx, post_cy - pre_cy
+        norm   = np.sqrt(dx**2 + dy**2) + 1e-10
+        nx, ny = dx / norm, dy / norm
+
+        pre_proj  = pre_df['x-coordinate'].values  * nx + pre_df['y-coordinate'].values  * ny
+        post_proj = post_df['x-coordinate'].values * nx + post_df['y-coordinate'].values * ny
+
+        gap = post_proj.min() - pre_proj.max()
+        verification['tests']['spatial_separation'] = {
+            'pre_proj_range':  (float(pre_proj.min()),  float(pre_proj.max())),
+            'post_proj_range': (float(post_proj.min()), float(post_proj.max())),
+            'separated':       gap > 0,
+            'gap':             float(gap),
+        }
+    else:
+        verification['tests']['spatial_separation'] = {
+            'separated': False, 'gap': 0.0,
+        }
+
+    # Test 3 — Transition region point count
+    trans = df[df['region'] == 'transition']
+    if len(trans) > 0:
+        verification['tests']['transition_region'] = {
+            'num_points': len(trans),
+            'y_range':    (trans['y-coordinate'].min(), trans['y-coordinate'].max()),
+            'width':      trans['y-coordinate'].max() - trans['y-coordinate'].min(),
+        }
+
+    return verification
+
+
+def extract_line_profiles(df, x_positions, y_positions):
+    """Extract pressure/velocity/temperature/density along fixed x and y slices."""
+    profiles = {'x_lines': {}, 'y_lines': {}}
+    tol = 0.002
+
+    for x in x_positions:
+        mask = np.abs(df['x-coordinate'] - x) < tol
+        if mask.any():
+            sub = df[mask].sort_values('y-coordinate')
+            profiles['x_lines'][x] = {
+                'y':           sub['y-coordinate'].values,
+                'pressure':    sub['pressure'].values,
+                'velocity':    sub['velocity-magnitude'].values,
+                'temperature': sub['temperature'].values,
+                'density':     sub['density'].values,
+            }
+
+    for y in y_positions:
+        mask = np.abs(df['y-coordinate'] - y) < tol
+        if mask.any():
+            sub = df[mask].sort_values('x-coordinate')
+            profiles['y_lines'][y] = {
+                'x':           sub['x-coordinate'].values,
+                'pressure':    sub['pressure'].values,
+                'velocity':    sub['velocity-magnitude'].values,
+                'temperature': sub['temperature'].values,
+                'density':     sub['density'].values,
+            }
+
+    return profiles
+
+
+# ============================================
+# VERSION 1  (dependency of Version 3)
+# ============================================
+
+class Version1_PressureBased:
+    """
+    Pressure-based bootstrap classifier used internally by Version 3.
+    Classifies by pressure relative to the midpoint of the observed
+    pressure range ±10% of the total jump.
+    """
+
+    def __init__(self):
+        self.diagnostics = {}
+
+    def classify(self, df):
+        p     = df['pressure'].values
+        p_min, p_max = p.min(), p.max()
+        jump  = p_max - p_min
+        p_mid = p_min + 0.5 * jump
+        band  = 0.10 * jump
+
+        pre_threshold  = p_mid - band
+        post_threshold = p_mid + band
+
+        labels = np.where(p <= pre_threshold, 'pre',
+                 np.where(p >= post_threshold, 'post', 'transition'))
+
+        self.diagnostics = {
+            'p_min': p_min, 'p_max': p_max,
+            'p_mid': p_mid, 'band_width': band,
+            'pre_threshold':  pre_threshold,
+            'post_threshold': post_threshold,
+        }
+        return pd.Series(labels, index=df.index, name='region')
+
+    def sample_points(self, df):
+        """
+        Stratified sampler used after classification.
+        Pre-shock: 2% random sample (large uniform region — dense sampling wasteful).
+        Transition: keep all points (critical for shock learning).
+        Post-shock: grid-based spatial sample to ensure coverage.
+        """
+        pre_df   = df[df['region'] == 'pre']
+        post_df  = df[df['region'] == 'post']
+        trans_df = df[df['region'] == 'transition']
+
+        pre_sample   = pre_df.sample(frac=PRE_SHOCK_SAMPLE_FRAC, random_state=RANDOM_SEED)
+        trans_sample = trans_df  # keep all
+
+        if len(post_df) > 0:
+            x_edges = np.linspace(post_df['x-coordinate'].min(),
+                                  post_df['x-coordinate'].max(),
+                                  POST_SHOCK_SAMPLE_GRID)
+            y_edges = np.linspace(post_df['y-coordinate'].min(),
+                                  post_df['y-coordinate'].max(),
+                                  POST_SHOCK_SAMPLE_GRID)
+
+            post_sample_idx = []
+            for i in range(len(x_edges) - 1):
+                for j in range(len(y_edges) - 1):
+                    cell = post_df[
+                        (post_df['x-coordinate'] >= x_edges[i]) &
+                        (post_df['x-coordinate'] <  x_edges[i+1]) &
+                        (post_df['y-coordinate'] >= y_edges[j]) &
+                        (post_df['y-coordinate'] <  y_edges[j+1])
+                    ]
+                    if len(cell) > 0:
+                        post_sample_idx.append(cell.sample(1).index[0])
+
+            post_sample = (post_df.loc[post_sample_idx] if post_sample_idx
+                           else post_df.sample(n=min(500, len(post_df)),
+                                               random_state=RANDOM_SEED))
+            # Guarantee minimum density
+            if len(post_sample) < 200 and len(post_df) >= 200:
+                post_sample = post_df.sample(n=200, random_state=RANDOM_SEED)
+        else:
+            post_sample = post_df
+
+        return pd.concat([pre_sample, post_sample, trans_sample], ignore_index=True)
+
+
+# ============================================
+# VERSION 3  — Shock Line Fitting
+# ============================================
+
+class Version3_ShockLineFitting:
+    """
+    Two-stage classifier:
+      Stage 1 — Bootstrap with pressure-based classification (V1).
+      Stage 2 — Fit an origin-forced shock line through the transition
+                 candidates; reclassify all points by signed distance
+                 from that line.
+
+    Falls back to Version 1 if fewer than 10 transition candidates
+    are found or if the line fit fails.
+    """
+
+    def __init__(self):
+        self.shock_slope     = None
+        self.shock_intercept = None
+        self.shock_angle     = None
+        self.diagnostics     = {}
+
+    def get_diagnostics(self):
+        return self.diagnostics
+
+    def classify(self, df):
+        # Stage 1: pressure bootstrap
+        v1      = Version1_PressureBased()
+        regions = v1.classify(df)
+        df      = df.copy()
+        df['region_temp'] = regions
+
+        candidate_df = df[df['region_temp'] == 'transition']
+
+        if len(candidate_df) >= 10:
+            candidate_coords = candidate_df[['x-coordinate', 'y-coordinate']].values
+            slope, intercept, angle = fit_shock_line(candidate_coords, slope_only=True)
+
+            if slope is not None:
+                self.shock_slope     = slope
+                self.shock_intercept = intercept
+                self.shock_angle     = angle
+
+                # Stage 2: reclassify by distance from fitted shock line
+                y_shock = slope * df['x-coordinate'].values + intercept
+                y_point = df['y-coordinate'].values
+                half    = TRANSITION_BAND_WIDTH / 2
+
+                labels = np.where(y_point < y_shock - half, 'post',
+                         np.where(y_point > y_shock + half, 'pre', 'transition'))
+
+                self.diagnostics = {
+                    'shock_slope':        slope,
+                    'shock_intercept':    intercept,
+                    'shock_angle':        angle,
+                    'candidate_points':   len(candidate_df),
+                    'fallback_used':      False,
+                }
+                return pd.Series(labels, index=df.index, name='region')
+
+        # Fallback
+        print("      ⚠ V3 fallback to V1 (insufficient candidates or fit failed)")
+        self.diagnostics = {
+            'shock_slope':       None,
+            'shock_intercept':   None,
+            'shock_angle':       None,
+            'candidate_points':  len(candidate_df),
+            'fallback_used':     True,
+        }
+        return v1.classify(df)
+
+    def sample_points(self, df):
+        return Version1_PressureBased().sample_points(df)
+
+
+# ============================================
+# FILE PROCESSING
+# ============================================
+
+def process_file(filepath):
+    """
+    Load, clean, classify with V3, and compute all diagnostics
+    for a single Excel file.
+
+    Returns (sampled_df, diagnostics_dict) or (None, None) on failure.
+    """
+    mach, angle = parse_filename(filepath)
+    if mach is None:
+        print(f"  ⚠ Could not parse filename: {os.path.basename(filepath)}")
+        return None, None
+
+    # Load
+    try:
+        df = pd.read_excel(filepath, engine='openpyxl')
+    except Exception as e:
+        print(f"  ✗ Failed to read {os.path.basename(filepath)}: {e}")
+        return None, None
+
+    df.columns = [c.strip() for c in df.columns]
+    if 'nodenumber' in df.columns:
+        df.drop(columns=['nodenumber'], inplace=True)
+
+    REQUIRED = ['x-coordinate', 'y-coordinate', 'pressure',
+                'density', 'velocity-magnitude', 'mach-number', 'temperature']
+    missing = [c for c in REQUIRED if c not in df.columns]
+    if missing:
+        print(f"  ✗ Missing columns in {os.path.basename(filepath)}: {missing}")
+        return None, None
+
+    df = df[REQUIRED].copy()
+
+    # Filter to geometry bounds
+    y_max_actual = df['y-coordinate'].max()
+    y_max_use    = GEOMETRY['y_max'] if GEOMETRY['y_max'] is not None else y_max_actual
+    df = df[
+        (df['x-coordinate'] >= GEOMETRY['x_min']) &
+        (df['x-coordinate'] <= GEOMETRY['x_max']) &
+        (df['y-coordinate'] >= GEOMETRY['y_min']) &
+        (df['y-coordinate'] <= y_max_use)
+    ]
+    print(f"    [{os.path.basename(filepath)}] "
+          f"x=[{df['x-coordinate'].min():.4f}, {df['x-coordinate'].max():.4f}]  "
+          f"y=[{df['y-coordinate'].min():.4f}, {y_max_actual:.4f}]")
+
+    # Clean
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    df.dropna(inplace=True)
+
+    # Input parameters
+    df['mach_input']  = mach
+    df['angle_input'] = angle
+
+    # Geometric features
+    x_safe = df['x-coordinate'].clip(lower=1e-4)
+    df['y_over_x']         = (df['y-coordinate'] / x_safe).clip(-50, 50)
+    df['r_from_tip']       = np.sqrt(df['x-coordinate']**2 + df['y-coordinate']**2)
+    wedge_slope_feat       = np.tan(np.radians(df['angle_input']))
+    df['dist_from_wedge']  = df['y-coordinate'] - df['x-coordinate'] * wedge_slope_feat
+    df['x_norm']           = df['x-coordinate'] * df['mach_input']
+    df['y_norm']           = df['y-coordinate'] * df['mach_input']
+    df['polar_angle']      = np.arctan2(df['y-coordinate'],
+                                        df['x-coordinate'].clip(lower=1e-4))
+
+    # Physics features from theoretical shock angle
+    beta_theory = compute_theoretical_shock_angle(mach, angle)
+    df['shock_angle_theory'] = beta_theory if not np.isnan(beta_theory) else 0.0
+
+    if not np.isnan(beta_theory):
+        shock_slope_feat = np.tan(np.radians(beta_theory))
+        numerator        = df['y-coordinate'] - shock_slope_feat * df['x-coordinate']
+        denominator      = np.sqrt(shock_slope_feat**2 + 1.0)
+        df['dist_from_shock'] = numerator / denominator
+    else:
+        df['dist_from_shock'] = 0.0
+
+    # Classify with V3
+    classifier = Version3_ShockLineFitting()
+    df['region'] = classifier.classify(df)
+
+    # Outlier removal
+    df, outlier_stats = remove_region_outliers(df, z_thresh=3.0)
+
+    # Force x < 0 to pre-shock (pure freestream by definition)
+    df.loc[df['x-coordinate'] < 0, 'region'] = 'pre'
+
+    # Integer-encode region
+    region_map = {'pre': 0, 'transition': 1, 'post': 2}
+    df['region_encoded'] = df['region'].map(region_map)
+
+    # Sample
+    sampled = classifier.sample_points(df)
+
+    # Diagnostics
+    line_profiles = extract_line_profiles(df, LINE_PROFILES_X, LINE_PROFILES_Y)
+    verification  = verify_region_separation(df)
+    rh_validation = validate_rankine_hugoniot(
+        df, mach, angle,
+        classifier.get_diagnostics().get('shock_angle', None)
+    )
+
+    diagnostics = {
+        'mach':                   mach,
+        'angle':                  angle,
+        'total_nodes':            len(df),
+        'sampled_nodes':          len(sampled),
+        'classifier_diagnostics': classifier.get_diagnostics(),
+        'outlier_removal':        outlier_stats,
+        'rh_validation':          rh_validation,
+        'verification':           verification,
+        'line_profiles':          line_profiles,
+        'filename':               os.path.basename(filepath),
+    }
+
+    return sampled, diagnostics
+
+
+# ============================================
+# DIAGNOSTIC PLOTS
+# ============================================
+
+def create_diagnostic_plots(master_df, version_diagnostics):
+    """Generate spatial, R-H validation, and per-file classification plots."""
+    version_dir = os.path.join(DIAGNOSTICS_DIR, "version_3")
+    os.makedirs(version_dir, exist_ok=True)
+
+    # Plot 1 — Region distribution bar chart
+    fig, ax = plt.subplots(figsize=(8, 5))
+    rc = master_df['region'].value_counts()
+    colors = {'pre': 'steelblue', 'transition': 'orange', 'post': 'crimson'}
+    ax.bar(rc.index, rc.values,
+           color=[colors.get(r, 'gray') for r in rc.index], alpha=0.85)
+    ax.set_title('Version 3: Region Distribution (all cases combined)')
+    ax.set_ylabel('Number of Points')
+    ax.set_xlabel('Region')
+    ax.grid(axis='y', alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(version_dir, "region_distribution.png"), dpi=150)
+    plt.close()
+
+    # Plot 2 — Spatial scatter (sample) + wedge + shock line
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    sample_df = master_df.sample(min(6000, len(master_df)), random_state=RANDOM_SEED)
+
+    sc = axes[0].scatter(sample_df['x-coordinate'], sample_df['y-coordinate'],
+                         c=sample_df['pressure'], cmap='viridis', s=1, alpha=0.5)
+    axes[0].set_title('Pressure Field (V3 sample)')
+    axes[0].set_xlabel('x (m)'); axes[0].set_ylabel('y (m)')
+    plt.colorbar(sc, ax=axes[0], label='Pressure (Pa)')
+
+    for region, col in [('pre','steelblue'), ('transition','orange'), ('post','crimson')]:
+        sub = sample_df[sample_df['region'] == region]
+        if len(sub) > 0:
+            axes[1].scatter(sub['x-coordinate'], sub['y-coordinate'],
+                            c=col, s=1, alpha=0.5, label=region)
+    axes[1].set_title('Region Classification (V3)')
+    axes[1].set_xlabel('x (m)'); axes[1].set_ylabel('y (m)')
+    axes[1].legend(markerscale=6, fontsize=9)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(version_dir, "spatial_classification.png"), dpi=150)
+    plt.close()
+
+    # Plot 3 — R-H validation bar chart
+    rh_data = []
+    for d in version_diagnostics:
+        rh = d.get('rh_validation', {})
+        if rh.get('valid') is not None:
+            rh_data.append({
+                'label':    f"M{d['mach']}_θ{d['angle']}",
+                'p_err':    rh.get('p_error_pct', np.nan),
+                'T_err':    rh.get('T_error_pct', np.nan),
+                'rho_err':  rh.get('rho_error_pct', np.nan),
+                'valid':    rh.get('valid', False),
+            })
+
+    if rh_data:
+        rh_df = pd.DataFrame(rh_data)
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+        fig.suptitle('Version 3: Rankine-Hugoniot Validation (% error vs theory)',
+                     fontsize=13)
+        for ax, col, title in zip(axes,
+                                  ['p_err', 'T_err', 'rho_err'],
+                                  ['Pressure ratio P₂/P₁',
+                                   'Temperature ratio T₂/T₁',
+                                   'Density ratio ρ₂/ρ₁']):
+            bar_colors = ['green' if v else 'red' for v in rh_df['valid']]
+            ax.bar(range(len(rh_df)), rh_df[col], color=bar_colors, alpha=0.75)
+            ax.axhline(5.0, color='red', linestyle='--', linewidth=1, label='5% tolerance')
+            ax.set_xticks(range(len(rh_df)))
+            ax.set_xticklabels(rh_df['label'], rotation=45, ha='right', fontsize=7)
+            ax.set_ylabel('Error (%)')
+            ax.set_title(title)
+            ax.legend(); ax.grid(axis='y', alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(version_dir, "rh_validation.png"), dpi=150)
+        plt.close()
+
+    # Plot 4 — Per-file classification scatter (up to 9 panels)
+    n_show = min(9, len(version_diagnostics))
+    if n_show > 0:
+        ncols = 3
+        nrows = (n_show + 2) // 3
+        fig, axes = plt.subplots(nrows, ncols, figsize=(15, 5 * nrows))
+        axes = np.array(axes).flatten()
+
+        for idx, diag in enumerate(version_diagnostics[:n_show]):
+            ax   = axes[idx]
+            mask = ((master_df['mach_input'] == diag['mach']) &
+                    (master_df['angle_input'] == diag['angle']))
+            fdf  = master_df[mask].sample(min(3000, mask.sum()), random_state=RANDOM_SEED)
+
+            for reg, col in [('pre','steelblue'), ('transition','orange'), ('post','crimson')]:
+                sub = fdf[fdf['region'] == reg]
+                if len(sub) > 0:
+                    ax.scatter(sub['x-coordinate'], sub['y-coordinate'],
+                               c=col, s=1, alpha=0.4, label=reg)
+
+            # Overlay detected shock line
+            cd = diag.get('classifier_diagnostics', {})
+            sa = cd.get('shock_angle', None)
+            if sa and not (isinstance(sa, float) and np.isnan(sa)):
+                sl  = np.tan(np.radians(sa))
+                xs  = np.array([0, GEOMETRY['x_max']])
+                ax.plot(xs, sl * xs, 'k--', linewidth=1.2, label=f'β={sa:.1f}°')
+
+            rh  = diag.get('rh_validation', {})
+            ax.set_xlim([GEOMETRY['x_min'], GEOMETRY['x_max']])
+            ax.set_ylim([GEOMETRY['y_min'],
+                         fdf['y-coordinate'].max() if len(fdf) > 0 else 0.45])
+            ax.set_title(f"M={diag['mach']} θ={diag['angle']}°  "
+                         f"RH:{'✓' if rh.get('valid') else '✗'}", fontsize=9)
+            ax.set_xlabel('x (m)', fontsize=8); ax.set_ylabel('y (m)', fontsize=8)
+            if idx == 0:
+                ax.legend(markerscale=5, fontsize=7)
+
+        for idx in range(n_show, len(axes)):
+            axes[idx].set_visible(False)
+        plt.tight_layout()
+        plt.savefig(os.path.join(version_dir, "per_file_classification.png"), dpi=150)
+        plt.close()
+
+    print(f"  ✓ Diagnostic plots saved → {version_dir}")
+
+
+# ============================================
+# BLACK-BOX REPORT
+# ============================================
+
+def generate_blackbox_report(output_dir, versions_dir, verification_dir):
+    """
+    Write a comprehensive quality-check report covering:
+    V3 parquet sanity, R-H per case, output means, shock angles,
+    feature ranges, file inventory, and automatic diagnosis.
+    """
+    lines = []
+    def w(s=""): lines.append(str(s))
+
+    w("=" * 78)
+    w("  OBLIQUE SHOCK ML — CODE I (V3 ONLY) BLACK BOX REPORT")
+    w(f"  Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    w("=" * 78)
+    w()
+
+    # Section 0 — Stamp
+    w("── SECTION 0: REPRODUCIBILITY STAMP ──────────────────────────────────────")
+    w(f"  Random seed:        {RANDOM_SEED}")
+    w(f"  Geometry x:         [{GEOMETRY['x_min']}, {GEOMETRY['x_max']}] m")
+    w(f"  Geometry y:         [{GEOMETRY['y_min']}, auto-detected] m")
+    w(f"  Transition band:    {TRANSITION_BAND_WIDTH} m  (±{TRANSITION_BAND_WIDTH/2} m)")
+    w(f"  Pre-shock sample:   {PRE_SHOCK_SAMPLE_FRAC*100:.1f}%")
+    w(f"  Post-shock grid:    {POST_SHOCK_SAMPLE_GRID}×{POST_SHOCK_SAMPLE_GRID}")
+    w(f"  Outlier z-thresh:   3.0 (pre: 4.5)")
+    w(f"  Input directory:    {INPUT_DIR}")
+    w()
+
+    # Section 1 — V3 parquet sanity
+    v3_path = os.path.join(versions_dir, "version_3_full.parquet")
+    w("── SECTION 1: VERSION 3 PARQUET SANITY ───────────────────────────────────")
+    w()
+    if os.path.exists(v3_path):
+        df = pd.read_parquet(v3_path)
+        w(f"  Shape:   {df.shape[0]:,} rows × {df.shape[1]} columns")
+        w(f"  Columns: {list(df.columns)}")
+        w()
+        num        = df.select_dtypes(include=[np.number])
+        nan_total  = int(num.isna().sum().sum())
+        inf_total  = int(np.isinf(num.values).sum())
+        w(f"  NaN total: {nan_total}  ({'✓ clean' if nan_total==0 else '✗ PROBLEM'})")
+        w(f"  Inf total: {inf_total}  ({'✓ clean' if inf_total==0 else '✗ PROBLEM'})")
+        w()
+        w(f"  Geometry bounds:")
+        w(f"    x: [{df['x-coordinate'].min():.4f}, {df['x-coordinate'].max():.4f}]")
+        w(f"    y: [{df['y-coordinate'].min():.4f}, {df['y-coordinate'].max():.4f}]")
+        w()
+        cases = df.groupby(['mach_input','angle_input']).size()
+        w(f"  Cases found: {len(cases)}")
+        w()
+        w("  Region distribution:")
+        for reg in ['pre','transition','post']:
+            if 'region' in df.columns:
+                n = (df['region']==reg).sum()
+                w(f"    {reg:12s}: {n:7,}  ({n/len(df)*100:.1f}%)")
+        w()
+        if 'region_encoded' in df.columns:
+            vals = sorted(df['region_encoded'].unique())
+            w(f"  region_encoded values: {vals}  "
+              f"{'✓ (0=pre,1=trans,2=post)' if vals==[0,1,2] else '✗ UNEXPECTED'}")
+        w()
+        if 'dist_from_shock' in df.columns and 'region' in df.columns:
+            pre_d  = df[df['region']=='pre']['dist_from_shock'].mean()
+            post_d = df[df['region']=='post']['dist_from_shock'].mean()
+            trans_d= df[df['region']=='transition']['dist_from_shock'].mean()
+            w("  dist_from_shock sign check:")
+            w(f"    pre   mean={pre_d:+.5f}  "
+              f"{'✓ positive (correct)' if pre_d>0 else '✗ WRONG SIGN'}")
+            w(f"    post  mean={post_d:+.5f}  "
+              f"{'✓ negative (correct)' if post_d<0 else '✗ WRONG SIGN'}")
+            w(f"    trans mean={trans_d:+.5f}  "
+              f"{'✓ near zero' if abs(trans_d)<0.01 else '⚠ too large'}")
+        w()
+        w("  Feature ranges:")
+        w(f"  {'Column':30s}  {'Min':>14}  {'Max':>14}  {'Mean':>14}")
+        w("  " + "─" * 75)
+        for col in df.select_dtypes(include=[np.number]).columns:
+            w(f"  {col:30s}  {df[col].min():>14.4f}  "
+              f"{df[col].max():>14.4f}  {df[col].mean():>14.4f}")
+        w()
+        w("  Per-case region counts:")
+        w(f"  {'M':>5}  {'θ':>6}  {'pre':>7}  {'trans':>7}  {'post':>6}  {'total':>7}")
+        w("  " + "─" * 45)
+        if 'region' in df.columns:
+            for (m, a), grp in df.groupby(['mach_input','angle_input']):
+                w(f"  {m:>5.1f}  {a:>6.1f}  "
+                  f"{(grp['region']=='pre').sum():>7,}  "
+                  f"{(grp['region']=='transition').sum():>7,}  "
+                  f"{(grp['region']=='post').sum():>6,}  "
+                  f"{len(grp):>7,}")
+        del df
+    else:
+        w(f"  ✗ version_3_full.parquet NOT FOUND at {v3_path}")
+    w()
+
+    # Section 2 — R-H per case
+    w("── SECTION 2: R-H VALIDATION PER CASE ────────────────────────────────────")
+    w()
+    diag_csv = os.path.join(versions_dir, "version_3_diagnostics.csv")
+    if os.path.exists(diag_csv):
+        import ast
+        diag_df = pd.read_csv(diag_csv)
+        rh_rows = []
+        for _, row in diag_df.iterrows():
+            try:
+                rh = ast.literal_eval(str(row['rh_validation']))
+                rh_rows.append({
+                    'mach':          row.get('mach', '?'),
+                    'angle':         row.get('angle', '?'),
+                    'valid':         rh.get('valid', False),
+                    'P_err%':        rh.get('p_error_pct', np.nan),
+                    'T_err%':        rh.get('T_error_pct', np.nan),
+                    'rho_err%':      rh.get('rho_error_pct', np.nan),
+                    'shock_angle':   rh.get('shock_angle_used', np.nan),
+                })
+            except Exception:
+                pass
+        if rh_rows:
+            rh_df   = pd.DataFrame(rh_rows).sort_values(['mach','angle'])
+            passed  = rh_df['valid'].sum()
+            w(f"  R-H pass: {passed}/{len(rh_df)}")
+            w(f"  Mean P err:   {rh_df['P_err%'].mean():.3f}%")
+            w(f"  Mean T err:   {rh_df['T_err%'].mean():.3f}%")
+            w(f"  Mean rho err: {rh_df['rho_err%'].mean():.3f}%")
+            w()
+            w(f"  {'M':>5}  {'θ':>6}  {'P_err%':>8}  "
+              f"{'T_err%':>8}  {'rho_err%':>10}  {'β_used':>8}  {'pass':>5}")
+            w("  " + "─" * 55)
+            for _, row in rh_df.iterrows():
+                flag = '✓' if row['valid'] else '✗'
+                w(f"  {row['mach']:>5.1f}  {row['angle']:>6.1f}  "
+                  f"{row['P_err%']:>8.3f}%  {row['T_err%']:>8.3f}%  "
+                  f"{row['rho_err%']:>10.3f}%  "
+                  f"{row['shock_angle']:>8.3f}°  {flag:>5}")
+    else:
+        w("  version_3_diagnostics.csv not found")
+    w()
+
+    # Section 3 — Post-shock output means
+    w("── SECTION 3: POST-SHOCK OUTPUT MEANS ────────────────────────────────────")
+    w()
+    post_csv = os.path.join(verification_dir, "output_means_post.csv")
+    if os.path.exists(post_csv):
+        post_df = pd.read_csv(post_csv)
+        out_vars = ['pressure','temperature','density','velocity-magnitude','mach-number']
+        w(f"  {'M':>5}  {'θ':>6}  {'P(Pa)':>12}  {'T(K)':>8}  "
+          f"{'rho':>8}  {'V(m/s)':>9}  {'M2':>7}")
+        w("  " + "─" * 60)
+        for _, row in post_df.sort_values(['mach_input','angle_input']).iterrows():
+            w(f"  {row['mach_input']:>5.1f}  {row['angle_input']:>6.1f}  "
+              f"{row['pressure']:>12.1f}  {row['temperature']:>8.2f}  "
+              f"{row['density']:>8.4f}  {row['velocity-magnitude']:>9.2f}  "
+              f"{row['mach-number']:>7.4f}")
+        w()
+        w("  Monotonicity check (P,T,rho↑ with θ; V,M↓ with θ):")
+        for m in sorted(post_df['mach_input'].unique()):
+            sub    = post_df[post_df['mach_input']==m].sort_values('angle_input')
+            p_ok   = all(sub['pressure'].diff().dropna() > 0)
+            T_ok   = all(sub['temperature'].diff().dropna() > 0)
+            rho_ok = all(sub['density'].diff().dropna() > 0)
+            V_ok   = all(sub['velocity-magnitude'].diff().dropna() < 0)
+            M_ok   = all(sub['mach-number'].diff().dropna() < 0)
+            w(f"    M={m}: P={'✓' if p_ok else '✗'}  T={'✓' if T_ok else '✗'}  "
+              f"rho={'✓' if rho_ok else '✗'}  V={'✓' if V_ok else '✗'}  "
+              f"M2={'✓' if M_ok else '✗'}")
+    else:
+        w("  output_means_post.csv not found")
+    w()
+
+    # Section 4 — Shock angles
+    w("── SECTION 4: SHOCK ANGLE ANALYSIS ───────────────────────────────────────")
+    w()
+    params_csv = os.path.join(versions_dir, "version_3_parameters.csv")
+    if os.path.exists(params_csv):
+        par = pd.read_csv(params_csv)
+        w(f"  {'M':>5}  {'θ':>6}  {'β_detected':>12}  {'β_theory':>10}  {'err':>8}")
+        w("  " + "─" * 48)
+        for _, row in par.sort_values(['mach','angle']).iterrows():
+            beta_th = compute_theoretical_shock_angle(row['mach'], row['angle'])
+            err     = (abs(row['shock_angle'] - beta_th)
+                       if not np.isnan(beta_th) and not np.isnan(row['shock_angle'])
+                       else np.nan)
+            flag    = ('✓' if not np.isnan(err) and err < 1.0 else
+                       '⚠' if not np.isnan(err) and err < 3.0 else '✗')
+            err_str = f'{err:.3f}°' if not np.isnan(err) else 'N/A'
+            bt_str  = f'{beta_th:.3f}°' if not np.isnan(beta_th) else 'N/A'
+            bd_str  = f"{row['shock_angle']:.3f}°" if not np.isnan(row['shock_angle']) else 'N/A'
+            w(f"  {flag} {row['mach']:>5.1f}  {row['angle']:>6.1f}  "
+              f"{bd_str:>12}  {bt_str:>10}  {err_str:>8}")
+    else:
+        w("  version_3_parameters.csv not found")
+    w()
+
+    # Section 5 — File inventory
+    w("── SECTION 5: FILE INVENTORY ──────────────────────────────────────────────")
+    w()
+    check = [
+        (versions_dir,    "version_3_full.parquet",        "Primary Code II input"),
+        (versions_dir,    "version_3_diagnostics.csv",     "R-H per-case data"),
+        (versions_dir,    "version_3_parameters.csv",      "Shock angle per case"),
+        (verification_dir,"output_means_post.csv",         "Code II physics reference"),
+        (verification_dir,"output_means_transition.csv",   "Code II physics reference"),
+    ]
+    for folder, fname, purpose in check:
+        full = os.path.join(folder, fname)
+        exists = os.path.exists(full)
+        size   = os.path.getsize(full) / 1024**2 if exists else 0
+        w(f"  {'✓' if exists else '✗'}  {fname:<45}  {size:>6.1f} MB  {purpose}")
+    w()
+
+    # Section 6 — Auto-diagnosis
+    w("── SECTION 6: AUTOMATIC DIAGNOSIS ────────────────────────────────────────")
+    w()
+    issues, actions = [], []
+    if not os.path.exists(v3_path):
+        issues.append("version_3_full.parquet MISSING")
+        actions.append("Code I did not complete — check for errors")
+    if os.path.exists(v3_path):
+        df_chk = pd.read_parquet(v3_path)
+        if 'dist_from_shock' in df_chk.columns and 'region' in df_chk.columns:
+            pre_s  = df_chk[df_chk['region']=='pre']['dist_from_shock'].mean()
+            post_s = df_chk[df_chk['region']=='post']['dist_from_shock'].mean()
+            if pre_s <= 0:
+                issues.append(f"dist_from_shock sign WRONG for pre (mean={pre_s:.4f})")
+                actions.append("Check sign convention in dist_from_shock calculation")
+            if post_s >= 0:
+                issues.append(f"dist_from_shock sign WRONG for post (mean={post_s:.4f})")
+                actions.append("Check sign convention in dist_from_shock calculation")
+        n_cases = len(df_chk.groupby(['mach_input','angle_input']))
+        issues.append(f"Found {n_cases} cases in V3 parquet")
+        del df_chk
+    if not os.path.exists(post_csv):
+        issues.append("output_means_post.csv MISSING")
+        actions.append("Physics reference plots in Code II will be unavailable")
+
+    w("  Issues / observations:")
+    for iss in issues:
+        w(f"    → {iss}")
+    w()
+    w("  Recommended actions:")
+    for i, act in enumerate(actions, 1):
+        w(f"    {i}. {act}")
+    w()
+
+    w("=" * 78)
+    w("  END OF V3 BLACK BOX REPORT")
+    w("=" * 78)
+
+    report_path = os.path.join(output_dir, "blackbox_code1_v3_report.txt")
+    with open(report_path, 'w') as f:
+        f.write('\n'.join(lines))
+
+    print(f"\n  ╔══════════════════════════════════════════════════════╗")
+    print(f"  ║  BLACK BOX REPORT saved:                             ║")
+    print(f"  ║  {report_path:<52} ║")
+    print(f"  ╚══════════════════════════════════════════════════════╝")
+    return report_path
+
+
+# ============================================
+# MAIN
+# ============================================
+
+def main():
+    print("=" * 70)
+    print("  DATA PREPROCESSING — VERSION 3 (SHOCK LINE FITTING) ONLY")
+    print("=" * 70)
+    print(f"\nGeometry: x=[{GEOMETRY['x_min']}, {GEOMETRY['x_max']}]  "
+          f"y=[{GEOMETRY['y_min']}, {GEOMETRY['y_max']}]")
+    print(f"Transition band: ±{TRANSITION_BAND_WIDTH/2} m\n")
+
+    # Discover and validate Excel files
+    all_xlsx = sorted([
+        os.path.join(INPUT_DIR, f)
+        for f in os.listdir(INPUT_DIR)
+        if f.lower().endswith('.xlsx')
+    ])
+
+    excel_files, bad_files = [], []
+    for fpath in all_xlsx:
+        mach, angle = parse_filename(fpath)
+        if mach is None:
+            bad_files.append(os.path.basename(fpath))
+        else:
+            excel_files.append(fpath)
+
+    if bad_files:
+        print("\n" + "=" * 70)
+        print("  ❌  UNRECOGNISED FILENAME(S) — CANNOT PROCEED")
+        print("=" * 70)
+        for bf in bad_files:
+            print(f"    ✗  {bf}")
+        print("""
+  Expected format:
+    wedge_M<mach>_angle<angle>.xlsx
+    wedge_M3_5_angle22_5.xlsx  (underscores as decimal separator)
+    wedge_M3.5_angle22.5.xlsx  (dots also accepted)
+  Please rename and re-run.
+""")
+        return
+
+    if not excel_files:
+        print("❌ No valid Excel files found. Check INPUT_DIR.")
+        return
+
+    print(f"Found {len(excel_files)} valid Excel files\n")
+
+    # Process all files
+    all_sampled          = []
+    version_diagnostics  = []
+    classifier_results   = []
+
+    for filepath in tqdm(excel_files, desc="V3 processing"):
+        sampled, diag = process_file(filepath)
+        if sampled is not None:
+            all_sampled.append(sampled)
+            version_diagnostics.append(diag)
+
+            cd = diag.get('classifier_diagnostics', {})
+            # Preferred detected angle; fall back to theoretical
+            detected_angle = cd.get('shock_angle', None)
+            if detected_angle is None or (isinstance(detected_angle, float) and
+                                          np.isnan(detected_angle)):
+                rh = diag.get('rh_validation', {})
+                detected_angle = rh.get('shock_angle_used', np.nan)
+            if detected_angle is None or (isinstance(detected_angle, float) and
+                                          np.isnan(detected_angle)):
+                detected_angle = compute_theoretical_shock_angle(diag['mach'], diag['angle'])
+
+            classifier_results.append({
+                'mach':        diag['mach'],
+                'angle':       diag['angle'],
+                'shock_angle': detected_angle,
+                'fallback':    cd.get('fallback_used', False),
+                'filename':    diag.get('filename', ''),
+            })
+
+    if not all_sampled:
+        print("❌ No data processed. Check INPUT_DIR and filenames.")
+        return
+
+    # Combine
+    master_df = pd.concat(all_sampled, ignore_index=True)
+    master_df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    master_df.dropna(inplace=True)
+
+    # Save outputs
+    full_path  = os.path.join(VERSIONS_DIR, "version_3_full.parquet")
+    train_path = os.path.join(VERSIONS_DIR, "version_3.parquet")
+    master_df.to_parquet(full_path, index=False)
+    master_df.drop(columns=['region']).to_parquet(train_path, index=False)
+
+    diag_df = pd.DataFrame(version_diagnostics)
+    diag_df.to_csv(os.path.join(VERSIONS_DIR, "version_3_diagnostics.csv"), index=False)
+
+    params_df = pd.DataFrame(classifier_results)
+    params_df.to_csv(os.path.join(VERSIONS_DIR, "version_3_parameters.csv"), index=False)
+
+    # Output means per region
+    output_vars = ['pressure','density','mach-number','velocity-magnitude','temperature']
+    for region in ['post','transition']:
+        sub = master_df[master_df['region'] == region]
+        if len(sub) > 0:
+            means = sub.groupby(['mach_input','angle_input'])[output_vars].mean().reset_index()
+            means.to_csv(os.path.join(VERIFICATION_DIR, f"output_means_{region}.csv"), index=False)
+
+    # Diagnostic plots (strip heavy line_profiles before storing)
+    for d in version_diagnostics:
+        d.pop('line_profiles', None)
+    create_diagnostic_plots(master_df, version_diagnostics)
+
+    # Console summary
+    print(f"\n{'=' * 70}")
+    print(f"  VERSION 3 COMPLETE")
+    print(f"{'=' * 70}")
+    print(f"  Files processed : {len(version_diagnostics)}")
+    print(f"  Total points    : {len(master_df):,}")
+    print(f"\n  Region distribution:")
+    rc = master_df['region'].value_counts()
+    for reg, cnt in rc.items():
+        print(f"    {reg:12s}: {cnt:7,}  ({cnt/len(master_df)*100:.1f}%)")
+
+    rh_pass = sum(d.get('rh_validation', {}).get('valid', False)
+                  for d in version_diagnostics)
+    spatial_sep = sum(d.get('verification', {}).get('tests', {})
+                       .get('spatial_separation', {}).get('separated', False)
+                      for d in version_diagnostics)
+    fallback_n  = sum(d.get('classifier_diagnostics', {}).get('fallback_used', False)
+                      for d in version_diagnostics)
+    print(f"\n  Verification:")
+    print(f"    Rankine-Hugoniot passed : {rh_pass}/{len(version_diagnostics)}")
+    print(f"    Spatially separated     : {spatial_sep}/{len(version_diagnostics)}")
+    print(f"    V1 fallback used        : {fallback_n}/{len(version_diagnostics)}")
+
+    print(f"\n  Per-file R-H errors (P / T / rho):")
+    for d in version_diagnostics:
+        rh   = d.get('rh_validation', {})
+        flag = '✓' if rh.get('valid') else '✗'
+        print(f"    {flag} M={d['mach']} θ={d['angle']:5.1f}°  "
+              f"P:{rh.get('p_error_pct', 99):.2f}%  "
+              f"T:{rh.get('T_error_pct', 99):.2f}%  "
+              f"rho:{rh.get('rho_error_pct', 99):.2f}%")
+
+    print(f"\n  Outputs saved:")
+    print(f"    {full_path}")
+    print(f"    {train_path}")
+    print(f"    {VERSIONS_DIR}/version_3_diagnostics.csv")
+    print(f"    {VERSIONS_DIR}/version_3_parameters.csv")
+    print(f"    {VERIFICATION_DIR}/output_means_post.csv")
+    print(f"    {VERIFICATION_DIR}/output_means_transition.csv")
+
+    generate_blackbox_report(OUTPUT_DIR, VERSIONS_DIR, VERIFICATION_DIR)
+
+    gc.collect()
+    print(f"\n{'=' * 70}")
+    print("  DONE")
+    print(f"{'=' * 70}")
+
+
+if __name__ == "__main__":
+    main()
